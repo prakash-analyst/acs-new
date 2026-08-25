@@ -110,16 +110,22 @@ jobs:
           clean: true
       - name: Verify required tooling
         run: |
-          for tool in curl jq tar git base64 sed awk grep find
+          missing=""
+          for tool in curl jq tar git base64 sed awk grep find python3
           do
             if ! command -v ${tool} >/dev/null 2>&1
             then
-              echo "[Error] - ${tool} not found on this self-hosted runner"
-              exit 1
+              missing="${missing} ${tool}"
             fi
           done
-          tar --version
+          if [[ -n "${missing}" ]]
+          then
+            echo "[Error] - missing tooling on runner ${RUNNER_NAME}:${missing}"
+            exit 1
+          fi
+          tar --version | head -1
           jq --version
+          python3 --version
       - name: Reset working directories
         run: |
           rm -rf /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures /tmp/jq /tmp/current_private_apps.json
@@ -165,7 +171,7 @@ jobs:
             cat /tmp/current_private_apps.json
             exit 1
           fi
-          jq -r '.apps[].name' /tmp/current_private_apps.json
+          jq -r '.apps[] | "  installed: " + .name + " version " + (.version // "unknown")' /tmp/current_private_apps.json
       - name: 'Upload Current Private Apps'
         uses: actions/upload-artifact@v4
         if: success()
@@ -210,21 +216,44 @@ jobs:
           done
           echo "---"
           ls -l /tmp/privateApps
-      - name: generate commit hash
-        id: commit
+      - name: Normalise app.conf line endings
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
-        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-      - name: Append Commit to App
+        run: |
+          for conf in $(find /tmp/privateApps -type f -name '*.conf')
+          do
+            if grep -q $'\r' "${conf}"
+            then
+              echo "[Fix] - stripping CR from ${conf}"
+              sed -i 's/\r$//' "${conf}"
+            fi
+          done
+      - name: Set deterministic app version
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         env:
-          commit_short: ${{ steps.commit.outputs.short }}
+          run_number: ${{ github.run_number }}
+          commit_sha: ${{ github.sha }}
         run: |
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
-            sed -i -e "s/^version[[:space:]]*=[[:space:]]*\(.*\)/version = \1+${commit_short}/g" ${appconf}
+            base=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "${appconf}" | head -1)
+            if [[ -z "${base}" ]]
+            then
+              echo "[Error] - no numeric version found in ${appconf}"
+              exit 1
+            fi
+            major=$(echo "${base}" | cut -d. -f1)
+            minor=$(echo "${base}" | cut -d. -f2)
+            if [[ -z "${minor}" ]]
+            then
+              minor=0
+            fi
+            new_version="${major}.${minor}.${run_number}"
+            sed -i -e "s/^version[[:space:]]*=.*/version = ${new_version}/" "${appconf}"
+            echo "[Version] - ${appconf} -> ${new_version}"
             echo "---"
-            cat ${appconf}
+            cat "${appconf}"
           done
+          echo "run ${run_number} corresponds to commit ${commit_sha}" >> $GITHUB_STEP_SUMMARY
       - name: Check for local directories
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
@@ -251,7 +280,7 @@ jobs:
               echo "[Error] - ${app} has no default/app.conf"
               exit 1
             fi
-            app_version=$(awk -F'=' '/^version[[:space:]]*=/ {v=$2; gsub(/[^0-9A-Za-z]+/,"_",v); gsub(/^_+|_+$/,"",v); print v; exit}' "${app}/default/app.conf")
+            app_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\(.*\)/\1/p' "${app}/default/app.conf" | head -1 | tr '.' '_')
             if [[ -z "${app_version}" ]]
             then
               echo "[Error] - could not read version from ${app}/default/app.conf"
@@ -261,6 +290,125 @@ jobs:
             COPYFILE_DISABLE=1 tar --format ustar -zcvf "/tmp/privatePackages/${app}_${app_version}.tgz" "${app}"
           done
           ls -l /tmp/privatePackages
+      - name: Show package locations
+        if: always()
+        run: |
+          echo "whoami        : $(whoami)"
+          echo "workspace     : ${GITHUB_WORKSPACE}"
+          echo "runner name   : ${RUNNER_NAME}"
+          echo "runner temp   : ${RUNNER_TEMP}"
+          echo "resolved /tmp : $(cd /tmp && pwd -P)"
+          echo "mount for /tmp:"
+          findmnt -T /tmp || true
+          echo "--- /tmp/privatePackages ---"
+          ls -la /tmp/privatePackages/ 2>/dev/null || echo "no privatePackages dir"
+          echo "--- /tmp/privateApps ---"
+          ls -la /tmp/privateApps/ 2>/dev/null || echo "no privateApps dir"
+      - name: 'Upload built packages for inspection'
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: privatePackages
+          path: /tmp/privatePackages/*.tgz
+          if-no-files-found: warn
+          retention-days: 5
+      - name: Validate packages before upload
+        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        run: |
+          python3 - <<'PYEOF'
+          import glob, re, sys, tarfile
+          rc = 0
+          pkgs = sorted(glob.glob('/tmp/privatePackages/*.tgz'))
+          if not pkgs:
+              print('[Error] - no packages found')
+              sys.exit(1)
+          ver_re = re.compile(r'^\d+\.\d+\.\d+$')
+          for pkg in pkgs:
+              print('[Validate] ' + pkg)
+              try:
+                  tf = tarfile.open(pkg, 'r:gz')
+              except Exception as exc:
+                  print('  [Error] - cannot open as gzip tar: %s' % exc)
+                  rc = 1
+                  continue
+              names = tf.getnames()
+              tops = set(n.split('/')[0] for n in names if n not in ('.', ''))
+              tops.discard('.')
+              if len(tops) != 1:
+                  print('  [Error] - expected exactly one top-level dir, found: %s' % sorted(tops))
+                  rc = 1
+                  tf.close()
+                  continue
+              app = tops.pop()
+              print('  top-level dir: %s' % app)
+              conf_path = app + '/default/app.conf'
+              if conf_path not in names:
+                  print('  [Error] - missing %s' % conf_path)
+                  rc = 1
+                  tf.close()
+                  continue
+              raw = tf.extractfile(conf_path).read().decode('utf-8', 'replace')
+              if '\r' in raw:
+                  print('  [Error] - app.conf contains CR characters (CRLF line endings)')
+                  rc = 1
+              stanza = None
+              found = {}
+              pkg_id = None
+              for line in raw.splitlines():
+                  s = line.strip()
+                  if not s or s.startswith('#'):
+                      continue
+                  if s.startswith('[') and s.endswith(']'):
+                      stanza = s[1:-1]
+                      continue
+                  if '=' not in s:
+                      continue
+                  k, v = s.split('=', 1)
+                  k = k.strip()
+                  v = v.strip()
+                  if k == 'version':
+                      found[stanza] = v
+                  if stanza == 'package' and k == 'id':
+                      pkg_id = v
+              if not found:
+                  print('  [Error] - no version key in app.conf')
+                  rc = 1
+              for stanza, v in found.items():
+                  ok = bool(ver_re.match(v))
+                  print('  [%s] version = %s  %s' % (stanza, v, 'OK' if ok else 'INVALID'))
+                  if not ok:
+                      rc = 1
+              distinct = set(found.values())
+              if len(distinct) > 1:
+                  print('  [Error] - conflicting versions across stanzas: %s' % sorted(distinct))
+                  rc = 1
+              if pkg_id is not None and pkg_id != app:
+                  print('  [Error] - [package] id "%s" does not match dir "%s"' % (pkg_id, app))
+                  rc = 1
+              for n in names:
+                  if '/local/' in n or n.endswith('/local'):
+                      print('  [Error] - local path present: %s' % n)
+                      rc = 1
+                  if n.split('/')[-1] in ('.DS_Store',) or '__MACOSX' in n:
+                      print('  [Error] - junk path present: %s' % n)
+                      rc = 1
+              tf.close()
+          sys.exit(rc)
+          PYEOF
+      - name: Optional slim validation
+        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        continue-on-error: true
+        run: |
+          if command -v slim >/dev/null 2>&1
+          then
+            for pkg in /tmp/privatePackages/*.tgz
+            do
+              echo "[slim] ${pkg}"
+              slim validate "${pkg}" || echo "[slim] - reported issues for ${pkg}"
+            done
+          else
+            echo "[skip] - slim not installed on this runner (pip install splunk-packaging-toolkit)"
+          fi
       - name: Run Apps through App Inspect
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         env:
@@ -375,18 +523,22 @@ jobs:
           for candidateApp in $(ls *.tgz 2>/dev/null)
           do
             echo "[ACS] - Installing ${candidateApp} to ${stack} via ${acs}"
-            appInstallation=$(curl -sX POST "https://${acs}/${stack}/adminconfig/v2/apps/victoria" \
-            --header "X-Splunk-Authorization: ${appinspect_token}" \
-            --header "Authorization: Bearer ${stack_jwt}" \
-            --header 'ACS-Legal-Ack: Y' \
-            --data-binary "@${candidateApp}")
-            echo ${appInstallation}
-            if echo "${appInstallation}" | jq -e '.code' >/dev/null 2>&1
+            http_code=$(curl -s -o /tmp/acs_install_response.json -w '%{http_code}' \
+              -X POST "https://${acs}/${stack}/adminconfig/v2/apps/victoria" \
+              --header "X-Splunk-Authorization: ${appinspect_token}" \
+              --header "Authorization: Bearer ${stack_jwt}" \
+              --header 'ACS-Legal-Ack: Y' \
+              --data-binary "@${candidateApp}")
+            echo "[ACS] - HTTP ${http_code}"
+            cat /tmp/acs_install_response.json
+            echo ""
+            if [[ "${http_code}" != "200" && "${http_code}" != "201" && "${http_code}" != "202" ]]
             then
-              echo "[Error] - ACS returned an error for ${candidateApp}"
+              echo "[Error] - ACS rejected ${candidateApp}"
               deploy_rc=1
             fi
           done
+          rm -f /tmp/acs_install_response.json
           exit ${deploy_rc}
       - name: Clean up working directories
         if: always()
