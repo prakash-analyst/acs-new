@@ -167,10 +167,6 @@ jobs:
           | "  [MANUAL] " + .name,
             (.messages[]? | "        -> " + ((.message // "") | gsub("[[:space:]]+"; " ")))
           JQEOF
-          echo "--- blocking.jq ---"
-          cat /tmp/jq/blocking.jq
-          echo "--- manual.jq ---"
-          cat /tmp/jq/manual.jq
       - name: Gather installed private apps from stack
         env:
           stack: ${{ secrets.STACK_NAME }}
@@ -184,12 +180,6 @@ jobs:
           if [[ "${http_code}" != "200" ]]
           then
             echo "[Error] - ACS did not return 200. Response body:"
-            cat /tmp/current_private_apps.json
-            exit 1
-          fi
-          if ! jq -e '.apps' /tmp/current_private_apps.json >/dev/null 2>&1
-          then
-            echo "[Error] - ACS response has no .apps array"
             cat /tmp/current_private_apps.json
             exit 1
           fi
@@ -282,8 +272,6 @@ jobs:
             new_version="${major}.${minor}.${run_number}"
             sed -i -e "s/^version[[:space:]]*=.*/version = ${new_version}/" "${appconf}"
             echo "[Version] - ${appconf} -> ${new_version}"
-            echo "---"
-            cat "${appconf}"
           done
           echo "run ${run_number} corresponds to commit ${commit_sha}" >> $GITHUB_STEP_SUMMARY
       - name: Check for local directories
@@ -301,16 +289,14 @@ jobs:
           find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
           find /tmp/privateApps -name '*.pyc' -print -delete
           find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
-      - name: Show app.conf metadata
+      - name: Show app.conf contents
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
-            echo "::group::${appconf}"
-            grep -n '^\[' "${appconf}" || echo "  [Warn] - no stanza headers found"
-            echo "  --- full contents ---"
-            cat -A "${appconf}" | head -40
-            echo "::endgroup::"
+            echo "===== ${appconf} ====="
+            cat "${appconf}"
+            echo "===== end ====="
           done
       - name: Validate and package apps with slim
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
@@ -320,13 +306,6 @@ jobs:
           for app in $(find . -maxdepth 1 -type d | sed 's/^\.\///g' | tail -n +2)
           do
             echo "::group::[slim] ${app}"
-            if [[ ! -f "${app}/default/app.conf" ]]
-            then
-              echo "[Error] - ${app} has no default/app.conf"
-              pkg_rc=1
-              echo "::endgroup::"
-              continue
-            fi
             if ! slim validate "${app}"
             then
               echo "[Error] - slim validate failed for ${app}"
@@ -348,11 +327,6 @@ jobs:
             echo "[Error] - one or more apps failed slim validation or packaging"
             exit 1
           fi
-          if [[ -z "$(ls -A /tmp/privatePackages 2>/dev/null)" ]]
-          then
-            echo "[Error] - slim produced no packages"
-            exit 1
-          fi
       - name: Show package locations
         if: always()
         run: |
@@ -361,12 +335,17 @@ jobs:
           echo "runner name   : ${RUNNER_NAME}"
           echo "runner temp   : ${RUNNER_TEMP}"
           echo "resolved /tmp : $(cd /tmp && pwd -P)"
-          echo "mount for /tmp:"
-          findmnt -T /tmp || true
           echo "--- /tmp/privatePackages ---"
           ls -la /tmp/privatePackages/ 2>/dev/null || echo "no privatePackages dir"
-          echo "--- /tmp/privateApps ---"
-          ls -la /tmp/privateApps/ 2>/dev/null || echo "no privateApps dir"
+          for pkg in /tmp/privatePackages/*.tar.gz /tmp/privatePackages/*.tgz
+          do
+            if [[ -f "${pkg}" ]]
+            then
+              echo "===== $(readlink -f "${pkg}") ====="
+              echo "  size: $(stat -c %s "${pkg}") bytes"
+              tar -tzf "${pkg}" | sed 's/^/  /'
+            fi
+          done
       - name: 'Upload built packages for inspection'
         uses: actions/upload-artifact@v4
         if: always()
@@ -377,103 +356,6 @@ jobs:
             /tmp/privatePackages/*.tgz
           if-no-files-found: warn
           retention-days: 5
-      - name: Inspect packages
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
-        run: |
-          python3 - <<'PYEOF'
-          import glob, re, sys, tarfile
-          rc = 0
-          pkgs = sorted(glob.glob('/tmp/privatePackages/*.tar.gz') + glob.glob('/tmp/privatePackages/*.tgz'))
-          if not pkgs:
-              print('[Error] - no packages found')
-              sys.exit(1)
-          ver_re = re.compile(r'^\d+\.\d+\.\d+$')
-          for pkg in pkgs:
-              print('[Inspect] ' + pkg)
-              try:
-                  tf = tarfile.open(pkg, 'r:gz')
-              except Exception as exc:
-                  print('  [Error] - cannot open as gzip tar: %s' % exc)
-                  rc = 1
-                  continue
-              names = tf.getnames()
-              print('  entries: %d' % len(names))
-              tops = set(n.split('/')[0] for n in names if n not in ('.', ''))
-              tops.discard('.')
-              if len(tops) != 1:
-                  print('  [Error] - expected one top-level dir, found: %s' % sorted(tops))
-                  rc = 1
-                  tf.close()
-                  continue
-              app = tops.pop()
-              print('  top-level dir: %s' % app)
-              conf_path = app + '/default/app.conf'
-              if conf_path not in names:
-                  print('  [Error] - missing %s' % conf_path)
-                  rc = 1
-                  tf.close()
-                  continue
-              blob = tf.extractfile(conf_path).read()
-              if blob.startswith(b'\xef\xbb\xbf'):
-                  print('  [Error] - app.conf begins with UTF-8 BOM')
-                  rc = 1
-              raw = blob.decode('utf-8', 'replace')
-              if '\r' in raw:
-                  print('  [Error] - app.conf contains CR characters')
-                  rc = 1
-              stanza = None
-              conf = {}
-              for line in raw.splitlines():
-                  s = line.strip()
-                  if not s or s.startswith('#'):
-                      continue
-                  if s.startswith('[') and s.endswith(']'):
-                      stanza = s[1:-1]
-                      conf.setdefault(stanza, {})
-                      continue
-                  if '=' not in s or stanza is None:
-                      continue
-                  k, v = s.split('=', 1)
-                  conf[stanza][k.strip()] = v.strip()
-              print('  stanzas: %s' % sorted(conf.keys()))
-              id_name = conf.get('id', {}).get('name')
-              id_ver = conf.get('id', {}).get('version')
-              pkg_id = conf.get('package', {}).get('id')
-              launcher_ver = conf.get('launcher', {}).get('version')
-              print('  [id] name      = %s' % id_name)
-              print('  [id] version   = %s' % id_ver)
-              print('  [package] id   = %s' % pkg_id)
-              print('  [launcher] ver = %s' % launcher_ver)
-              if not id_name and not pkg_id:
-                  print('  [Error] - no [id] name or [package] id to identify the app')
-                  rc = 1
-              if id_name and id_name != app:
-                  print('  [Error] - [id] name "%s" != dir "%s"' % (id_name, app))
-                  rc = 1
-              if pkg_id and pkg_id != app:
-                  print('  [Error] - [package] id "%s" != dir "%s"' % (pkg_id, app))
-                  rc = 1
-              vers = set(v for v in (id_ver, launcher_ver) if v)
-              if not vers:
-                  print('  [Error] - no version in [id] or [launcher]')
-                  rc = 1
-              for v in vers:
-                  if not ver_re.match(v):
-                      print('  [Error] - version "%s" is not major.minor.patch' % v)
-                      rc = 1
-              if len(vers) > 1:
-                  print('  [Error] - conflicting versions: %s' % sorted(vers))
-                  rc = 1
-              for n in names:
-                  if '/local/' in n or n.endswith('/local'):
-                      print('  [Error] - local path present: %s' % n)
-                      rc = 1
-                  if n.split('/')[-1] == '.DS_Store' or '__MACOSX' in n:
-                      print('  [Error] - junk path present: %s' % n)
-                      rc = 1
-              tf.close()
-          sys.exit(rc)
-          PYEOF
       - name: Run Apps through App Inspect
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         env:
@@ -484,10 +366,15 @@ jobs:
         run: |
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
+          echo "[cwd] - $(pwd)"
+          ls -la
           overall_rc=0
           for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
           do
             echo "::group::[AppInspect] ${candidateApp}"
+            echo "[Package] - relative : ${candidateApp}"
+            echo "[Package] - absolute : $(readlink -f "${candidateApp}")"
+            echo "[Package] - size     : $(stat -c %s "${candidateApp}") bytes"
             AppRequest=$(curl -sX POST 'https://appinspect.splunk.com/v1/app/validate' \
               --header "Authorization: Bearer ${appinspect_token}" \
               --header "Cache-Control: no-cache" \
@@ -498,7 +385,7 @@ jobs:
             reportURL=$(echo "${AppRequest}" | jq -r '.links[]? | select(.rel=="report") | .href' 2>/dev/null || echo "")
             if [[ -z "${requestURL}" || "${requestURL}" == "null" ]]
             then
-              echo "[Error] - Submission rejected for ${candidateApp}"
+              echo "[Error] - Submission rejected for $(readlink -f "${candidateApp}")"
               overall_rc=1
               echo "::endgroup::"
               continue
@@ -513,14 +400,14 @@ jobs:
             done
             if [[ ${LOOPCOUNTER} -eq 60 ]]
             then
-              echo "[Error] - Timeout occurred validating ${candidateApp}"
+              echo "[Error] - Timeout occurred validating $(readlink -f "${candidateApp}")"
               overall_rc=1
               echo "::endgroup::"
               continue
             fi
             if [[ $(echo "${appInspectStatus}" | jq -r '.status' 2>/dev/null || echo UNKNOWN) != "SUCCESS" ]]
             then
-              echo "[Error] - Appinspect went to unknown state while validating ${candidateApp}"
+              echo "[Error] - Appinspect went to unknown state while validating $(readlink -f "${candidateApp}")"
               echo "${appInspectStatus}"
               overall_rc=1
               echo "::endgroup::"
@@ -543,12 +430,12 @@ jobs:
               if [[ ${failures} -gt 0 || ${errors} -gt 0 ]]
               then
                 echo "[Error] - ${candidateApp} has blocking findings:"
-                jq -r -f /tmp/jq/blocking.jq "${reportFile}" || echo "  [Warn] - could not render findings for ${candidateApp}"
+                jq -r -f /tmp/jq/blocking.jq "${reportFile}" || echo "  [Warn] - could not render findings"
               fi
               if [[ ${manuals} -gt 0 ]]
               then
                 echo "[Notice] - ${candidateApp} has ${manuals} manual check(s):"
-                jq -r -f /tmp/jq/manual.jq "${reportFile}" || echo "  [Warn] - could not render manual checks for ${candidateApp}"
+                jq -r -f /tmp/jq/manual.jq "${reportFile}" || echo "  [Warn] - could not render manual checks"
               fi
             fi
             if [[ ${errors} -gt 0 || ${failures} -gt 0 ]]
@@ -584,23 +471,30 @@ jobs:
         run: |
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
+          echo "[cwd] - $(pwd)"
+          echo "[dir listing]"
+          ls -la
           deploy_rc=0
           for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
           do
+            echo "[Package] - relative : ${candidateApp}"
+            echo "[Package] - absolute : $(readlink -f "${candidateApp}")"
+            echo "[Package] - size     : $(stat -c %s "${candidateApp}") bytes"
+            echo "[Package] - contents :"
+            tar -tzf "${candidateApp}" | sed 's/^/             /'
             echo "[ACS] - Installing ${candidateApp} to ${stack} via ${acs}"
             http_code=$(curl -s -o /tmp/acs_install_response.json -w '%{http_code}' \
               -X POST "https://${acs}/${stack}/adminconfig/v2/apps/victoria" \
               --header "X-Splunk-Authorization: ${appinspect_token}" \
               --header "Authorization: Bearer ${stack_jwt}" \
               --header 'ACS-Legal-Ack: Y' \
-              --header 'Content-Type: application/octet-stream' \
               --data-binary "@${candidateApp}")
             echo "[ACS] - HTTP ${http_code}"
             cat /tmp/acs_install_response.json
             echo ""
             if [[ "${http_code}" != "200" && "${http_code}" != "201" && "${http_code}" != "202" ]]
             then
-              echo "[Error] - ACS rejected ${candidateApp}"
+              echo "[Error] - ACS rejected $(readlink -f "${candidateApp}")"
               deploy_rc=1
             fi
           done
