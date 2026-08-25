@@ -15,7 +15,7 @@ env:
 jobs:
 
   validate_stack_and_acs_credentials_configured:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Check STACK_NAME is set as a GitHub Secret
         env:
@@ -37,7 +37,7 @@ jobs:
           fi
 
   validate_splunkbase_credentials_configured:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Check SPLUNKBASE_USERNAME is set as a GitHub Secret
         env:
@@ -63,7 +63,7 @@ jobs:
       splunkapi_auth_token: ${{ steps.auth-splunk-api.outputs.api_auth_token }}
       splunkbase_auth_token: ${{ steps.authenticate-splunkbase.outputs.auth_token }}
     needs: [validate_splunkbase_credentials_configured, validate_stack_and_acs_credentials_configured]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: authenticate with splunkbase
         id: authenticate-splunkbase
@@ -101,7 +101,7 @@ jobs:
 
   private_app_management:
     needs: [authenticate_with_splunk]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repo code
         uses: actions/checkout@v5
