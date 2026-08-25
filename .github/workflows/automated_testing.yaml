@@ -167,23 +167,6 @@ jobs:
         with:
           fetch-depth: 0
           clean: true
-      - name: Verify required tooling
-        run: |
-          missing=""
-          for tool in curl jq tar git base64 sed awk grep find xxd
-          do
-            if ! command -v ${tool} >/dev/null 2>&1
-            then
-              missing="${missing} ${tool}"
-            fi
-          done
-          if [[ -n "${missing}" ]]
-          then
-            echo "[Error] - missing tooling on runner ${RUNNER_NAME}:${missing}"
-            exit 1
-          fi
-          tar --version | head -1
-          jq --version
       - name: Reset working directories
         run: |
           rm -rf /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures /tmp/jq
@@ -221,36 +204,12 @@ jobs:
             echo "  ${app}"
             cp -rp privateApps/${app} /tmp/privateApps
           done
-          echo "---"
-          ls -l /tmp/privateApps
-      - name: Normalise conf file encoding
-        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
-        run: |
-          for conf in $(find /tmp/privateApps -type f -name '*.conf')
-          do
-            if grep -q $'\r' "${conf}"
-            then
-              echo "[Fix] - stripping CR from ${conf}"
-              sed -i 's/\r$//' "${conf}"
-            fi
-            if [[ $(head -c 3 "${conf}" | xxd -p) == "efbbbf" ]]
-            then
-              echo "[Fix] - stripping UTF-8 BOM from ${conf}"
-              sed -i '1s/^\xEF\xBB\xBF//' "${conf}"
-            fi
-            if [[ -n $(tail -c 1 "${conf}") ]]
-            then
-              echo "[Fix] - adding trailing newline to ${conf}"
-              echo "" >> "${conf}"
-            fi
-          done
       - name: Append commit hash to app version
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
           commit_sha: ${{ github.sha }}
         run: |
           commit_short="${commit_sha:0:7}"
-          echo "[Commit] - ${commit_short}"
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
             base=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "${appconf}" | head -1)
@@ -271,101 +230,39 @@ jobs:
             echo "Local Directories Present"
             exit 1
           fi
-      - name: Strip junk files before packaging
-        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
-        run: |
-          find /tmp/privateApps -name '.DS_Store' -print -delete
-          find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
-          find /tmp/privateApps -name '*.pyc' -print -delete
-          find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
-          find /tmp/privateApps -name 'app.manifest' -print -delete
-      - name: Show app.conf contents
-        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
-        run: |
-          for appconf in $(find /tmp/privateApps -type f -name app.conf)
-          do
-            echo "===== ${appconf} ====="
-            cat "${appconf}"
-            echo "===== end ====="
-          done
       - name: Package Apps for validation
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           cd /tmp/privateApps
           for app in $(find . -maxdepth 1 -type d | sed 's/^\.\///g' | tail -n +2)
           do
-            if [[ ! -f "${app}/default/app.conf" ]]
-            then
-              echo "[Error] - ${app} has no default/app.conf"
-              exit 1
-            fi
             app_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\(.*\)/\1/p' "${app}/default/app.conf" | head -1 | tr '.+' '__')
-            if [[ -z "${app_version}" ]]
-            then
-              echo "[Error] - could not read version from ${app}/default/app.conf"
-              exit 1
-            fi
             echo "[Package] - ${app} -> ${app}_${app_version}.tgz"
             COPYFILE_DISABLE=1 tar -czf "/tmp/privatePackages/${app}_${app_version}.tgz" "${app}"
           done
-          ls -l /tmp/privatePackages
-      - name: Show package locations
-        if: always()
-        run: |
-          echo "whoami        : $(whoami)"
-          echo "workspace     : ${GITHUB_WORKSPACE}"
-          echo "runner name   : ${RUNNER_NAME}"
-          echo "runner temp   : ${RUNNER_TEMP}"
-          echo "resolved /tmp : $(cd /tmp && pwd -P)"
-          echo "--- /tmp/privatePackages ---"
-          ls -la /tmp/privatePackages/ 2>/dev/null || echo "no privatePackages dir"
-          for pkg in /tmp/privatePackages/*.tgz
-          do
-            if [[ -f "${pkg}" ]]
-            then
-              echo "===== $(readlink -f "${pkg}") ====="
-              echo "  size: $(stat -c %s "${pkg}") bytes"
-              tar -tzf "${pkg}" | sed 's/^/  /'
-            fi
-          done
-      - name: 'Upload built packages for inspection'
-        uses: actions/upload-artifact@v4
-        if: ${{ always() && steps.changed-files.outputs.any_changed == 'true' }}
-        with:
-          name: privatePackages
-          path: /tmp/privatePackages/*.tgz
-          if-no-files-found: ignore
-          retention-days: 5
       - name: Run Apps through App Inspect
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
-          stack: ${{ secrets.STACK_NAME }}
-          stack_jwt: ${{ secrets.STACK_TOKEN }}
           appinspect_token: ${{ needs.authenticate_with_splunk.outputs.splunkapi_auth_token }}
           allow_manual_check: 'true'
         run: |
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
-          echo "[cwd] - $(pwd)"
-          ls -la
           overall_rc=0
           for candidateApp in $(ls *.tgz 2>/dev/null)
           do
             echo "::group::[AppInspect] ${candidateApp}"
-            echo "[Package] - relative : ${candidateApp}"
-            echo "[Package] - absolute : $(readlink -f "${candidateApp}")"
-            echo "[Package] - size     : $(stat -c %s "${candidateApp}") bytes"
             AppRequest=$(curl -sX POST 'https://appinspect.splunk.com/v1/app/validate' \
               --header "Authorization: Bearer ${appinspect_token}" \
               --header "Cache-Control: no-cache" \
               --form "app_package=@\"${candidateApp}\"" \
               --form 'included_tags="private_app"')
-            echo "${AppRequest}"
             requestURL=$(echo "${AppRequest}" | jq -r '.links[]? | select(.rel=="status") | .href' 2>/dev/null || echo "")
             reportURL=$(echo "${AppRequest}" | jq -r '.links[]? | select(.rel=="report") | .href' 2>/dev/null || echo "")
             if [[ -z "${requestURL}" || "${requestURL}" == "null" ]]
             then
-              echo "[Error] - Submission rejected for $(readlink -f "${candidateApp}")"
+              echo "[Error] - Submission rejected for ${candidateApp}"
+              echo "${AppRequest}"
               overall_rc=1
               echo "::endgroup::"
               continue
@@ -380,14 +277,14 @@ jobs:
             done
             if [[ ${LOOPCOUNTER} -eq 60 ]]
             then
-              echo "[Error] - Timeout occurred validating $(readlink -f "${candidateApp}")"
+              echo "[Error] - Timeout occurred validating ${candidateApp}"
               overall_rc=1
               echo "::endgroup::"
               continue
             fi
             if [[ $(echo "${appInspectStatus}" | jq -r '.status' 2>/dev/null || echo UNKNOWN) != "SUCCESS" ]]
             then
-              echo "[Error] - Appinspect went to unknown state while validating $(readlink -f "${candidateApp}")"
+              echo "[Error] - Appinspect went to unknown state while validating ${candidateApp}"
               echo "${appInspectStatus}"
               overall_rc=1
               echo "::endgroup::"
@@ -401,30 +298,20 @@ jobs:
             curl -sX GET "https://appinspect.splunk.com${reportURL}" \
               --header "Authorization: Bearer ${appinspect_token}" \
               --header "Accept: application/json" > "${reportFile}"
-            if ! jq -e '.reports' "${reportFile}" >/dev/null 2>&1
+            if [[ ${failures} -gt 0 || ${errors} -gt 0 ]]
             then
-              echo "[Warn] - Report for ${candidateApp} is not parseable JSON, raw head follows:"
-              head -c 2000 "${reportFile}"
-              echo ""
-            else
-              if [[ ${failures} -gt 0 || ${errors} -gt 0 ]]
-              then
-                echo "[Error] - ${candidateApp} has blocking findings:"
-                jq -r -f /tmp/jq/blocking.jq "${reportFile}" || echo "  [Warn] - could not render findings"
-              fi
-              if [[ ${manuals} -gt 0 ]]
-              then
-                echo "[Notice] - ${candidateApp} has ${manuals} manual check(s):"
-                jq -r -f /tmp/jq/manual.jq "${reportFile}" || echo "  [Warn] - could not render manual checks"
-              fi
-            fi
-            if [[ ${errors} -gt 0 || ${failures} -gt 0 ]]
-            then
+              echo "[Error] - ${candidateApp} has blocking findings:"
+              jq -r -f /tmp/jq/blocking.jq "${reportFile}" || echo "  [Warn] - could not render findings"
               overall_rc=1
             fi
-            if [[ ${manuals} -gt 0 && "${allow_manual_check}" != "true" ]]
+            if [[ ${manuals} -gt 0 ]]
             then
-              overall_rc=1
+              echo "[Notice] - ${candidateApp} has ${manuals} manual check(s):"
+              jq -r -f /tmp/jq/manual.jq "${reportFile}" || echo "  [Warn] - could not render manual checks"
+              if [[ "${allow_manual_check}" != "true" ]]
+              then
+                overall_rc=1
+              fi
             fi
             if [[ ${errors} -eq 0 && ${failures} -eq 0 ]]
             then
