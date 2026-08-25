@@ -13,7 +13,6 @@ concurrency:
 
 env:
   acs_endpoint: admin.splunk.com
-  json_schema: https://admin.splunk.com/service/info/specs/v2/openapi.json
 
 jobs:
 
