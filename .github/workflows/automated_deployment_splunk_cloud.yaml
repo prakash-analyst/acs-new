@@ -111,7 +111,7 @@ jobs:
       - name: Verify required tooling
         run: |
           missing=""
-          for tool in curl jq tar git base64 sed awk grep find python3
+          for tool in curl jq tar git base64 sed awk grep find python3 xxd
           do
             if ! command -v ${tool} >/dev/null 2>&1
             then
@@ -126,6 +126,28 @@ jobs:
           tar --version | head -1
           jq --version
           python3 --version
+      - name: Ensure slim is available
+        run: |
+          if command -v slim >/dev/null 2>&1
+          then
+            echo "[slim] - already installed"
+            slim --version || true
+            exit 0
+          fi
+          echo "[slim] - not found, attempting user install"
+          python3 -m pip install --user splunk-packaging-toolkit || true
+          export PATH="${HOME}/.local/bin:${PATH}"
+          echo "${HOME}/.local/bin" >> $GITHUB_PATH
+          if command -v slim >/dev/null 2>&1
+          then
+            echo "[slim] - installed"
+            slim --version || true
+          else
+            echo "[Error] - slim is required for packaging and is not installed"
+            echo "          Install it once on this runner with:"
+            echo "          pip3 install splunk-packaging-toolkit"
+            exit 1
+          fi
       - name: Reset working directories
         run: |
           rm -rf /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures /tmp/jq /tmp/current_private_apps.json
@@ -216,7 +238,7 @@ jobs:
           done
           echo "---"
           ls -l /tmp/privateApps
-      - name: Normalise app.conf line endings
+      - name: Normalise conf file encoding
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
           for conf in $(find /tmp/privateApps -type f -name '*.conf')
@@ -225,6 +247,16 @@ jobs:
             then
               echo "[Fix] - stripping CR from ${conf}"
               sed -i 's/\r$//' "${conf}"
+            fi
+            if [[ $(head -c 3 "${conf}" | xxd -p) == "efbbbf" ]]
+            then
+              echo "[Fix] - stripping UTF-8 BOM from ${conf}"
+              sed -i '1s/^\xEF\xBB\xBF//' "${conf}"
+            fi
+            if [[ -n $(tail -c 1 "${conf}") ]]
+            then
+              echo "[Fix] - adding trailing newline to ${conf}"
+              echo "" >> "${conf}"
             fi
           done
       - name: Set deterministic app version
@@ -269,27 +301,58 @@ jobs:
           find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
           find /tmp/privateApps -name '*.pyc' -print -delete
           find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
-      - name: Package Apps for validation
+      - name: Show app.conf metadata
+        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        run: |
+          for appconf in $(find /tmp/privateApps -type f -name app.conf)
+          do
+            echo "::group::${appconf}"
+            grep -n '^\[' "${appconf}" || echo "  [Warn] - no stanza headers found"
+            echo "  --- full contents ---"
+            cat -A "${appconf}" | head -40
+            echo "::endgroup::"
+          done
+      - name: Validate and package apps with slim
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
           cd /tmp/privateApps
+          pkg_rc=0
           for app in $(find . -maxdepth 1 -type d | sed 's/^\.\///g' | tail -n +2)
           do
+            echo "::group::[slim] ${app}"
             if [[ ! -f "${app}/default/app.conf" ]]
             then
               echo "[Error] - ${app} has no default/app.conf"
-              exit 1
+              pkg_rc=1
+              echo "::endgroup::"
+              continue
             fi
-            app_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\(.*\)/\1/p' "${app}/default/app.conf" | head -1 | tr '.' '_')
-            if [[ -z "${app_version}" ]]
+            if ! slim validate "${app}"
             then
-              echo "[Error] - could not read version from ${app}/default/app.conf"
-              exit 1
+              echo "[Error] - slim validate failed for ${app}"
+              pkg_rc=1
+              echo "::endgroup::"
+              continue
             fi
-            echo "[Package] - ${app} version token ${app_version}"
-            COPYFILE_DISABLE=1 tar --format ustar -zcvf "/tmp/privatePackages/${app}_${app_version}.tgz" "${app}"
+            if ! slim package -o /tmp/privatePackages "${app}"
+            then
+              echo "[Error] - slim package failed for ${app}"
+              pkg_rc=1
+            fi
+            echo "::endgroup::"
           done
-          ls -l /tmp/privatePackages
+          echo "--- packages produced ---"
+          ls -l /tmp/privatePackages || true
+          if [[ ${pkg_rc} -ne 0 ]]
+          then
+            echo "[Error] - one or more apps failed slim validation or packaging"
+            exit 1
+          fi
+          if [[ -z "$(ls -A /tmp/privatePackages 2>/dev/null)" ]]
+          then
+            echo "[Error] - slim produced no packages"
+            exit 1
+          fi
       - name: Show package locations
         if: always()
         run: |
@@ -309,22 +372,24 @@ jobs:
         if: always()
         with:
           name: privatePackages
-          path: /tmp/privatePackages/*.tgz
+          path: |
+            /tmp/privatePackages/*.tar.gz
+            /tmp/privatePackages/*.tgz
           if-no-files-found: warn
           retention-days: 5
-      - name: Validate packages before upload
+      - name: Inspect packages
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
           python3 - <<'PYEOF'
           import glob, re, sys, tarfile
           rc = 0
-          pkgs = sorted(glob.glob('/tmp/privatePackages/*.tgz'))
+          pkgs = sorted(glob.glob('/tmp/privatePackages/*.tar.gz') + glob.glob('/tmp/privatePackages/*.tgz'))
           if not pkgs:
               print('[Error] - no packages found')
               sys.exit(1)
           ver_re = re.compile(r'^\d+\.\d+\.\d+$')
           for pkg in pkgs:
-              print('[Validate] ' + pkg)
+              print('[Inspect] ' + pkg)
               try:
                   tf = tarfile.open(pkg, 'r:gz')
               except Exception as exc:
@@ -332,10 +397,11 @@ jobs:
                   rc = 1
                   continue
               names = tf.getnames()
+              print('  entries: %d' % len(names))
               tops = set(n.split('/')[0] for n in names if n not in ('.', ''))
               tops.discard('.')
               if len(tops) != 1:
-                  print('  [Error] - expected exactly one top-level dir, found: %s' % sorted(tops))
+                  print('  [Error] - expected one top-level dir, found: %s' % sorted(tops))
                   rc = 1
                   tf.close()
                   continue
@@ -347,68 +413,67 @@ jobs:
                   rc = 1
                   tf.close()
                   continue
-              raw = tf.extractfile(conf_path).read().decode('utf-8', 'replace')
+              blob = tf.extractfile(conf_path).read()
+              if blob.startswith(b'\xef\xbb\xbf'):
+                  print('  [Error] - app.conf begins with UTF-8 BOM')
+                  rc = 1
+              raw = blob.decode('utf-8', 'replace')
               if '\r' in raw:
-                  print('  [Error] - app.conf contains CR characters (CRLF line endings)')
+                  print('  [Error] - app.conf contains CR characters')
                   rc = 1
               stanza = None
-              found = {}
-              pkg_id = None
+              conf = {}
               for line in raw.splitlines():
                   s = line.strip()
                   if not s or s.startswith('#'):
                       continue
                   if s.startswith('[') and s.endswith(']'):
                       stanza = s[1:-1]
+                      conf.setdefault(stanza, {})
                       continue
-                  if '=' not in s:
+                  if '=' not in s or stanza is None:
                       continue
                   k, v = s.split('=', 1)
-                  k = k.strip()
-                  v = v.strip()
-                  if k == 'version':
-                      found[stanza] = v
-                  if stanza == 'package' and k == 'id':
-                      pkg_id = v
-              if not found:
-                  print('  [Error] - no version key in app.conf')
+                  conf[stanza][k.strip()] = v.strip()
+              print('  stanzas: %s' % sorted(conf.keys()))
+              id_name = conf.get('id', {}).get('name')
+              id_ver = conf.get('id', {}).get('version')
+              pkg_id = conf.get('package', {}).get('id')
+              launcher_ver = conf.get('launcher', {}).get('version')
+              print('  [id] name      = %s' % id_name)
+              print('  [id] version   = %s' % id_ver)
+              print('  [package] id   = %s' % pkg_id)
+              print('  [launcher] ver = %s' % launcher_ver)
+              if not id_name and not pkg_id:
+                  print('  [Error] - no [id] name or [package] id to identify the app')
                   rc = 1
-              for stanza, v in found.items():
-                  ok = bool(ver_re.match(v))
-                  print('  [%s] version = %s  %s' % (stanza, v, 'OK' if ok else 'INVALID'))
-                  if not ok:
+              if id_name and id_name != app:
+                  print('  [Error] - [id] name "%s" != dir "%s"' % (id_name, app))
+                  rc = 1
+              if pkg_id and pkg_id != app:
+                  print('  [Error] - [package] id "%s" != dir "%s"' % (pkg_id, app))
+                  rc = 1
+              vers = set(v for v in (id_ver, launcher_ver) if v)
+              if not vers:
+                  print('  [Error] - no version in [id] or [launcher]')
+                  rc = 1
+              for v in vers:
+                  if not ver_re.match(v):
+                      print('  [Error] - version "%s" is not major.minor.patch' % v)
                       rc = 1
-              distinct = set(found.values())
-              if len(distinct) > 1:
-                  print('  [Error] - conflicting versions across stanzas: %s' % sorted(distinct))
-                  rc = 1
-              if pkg_id is not None and pkg_id != app:
-                  print('  [Error] - [package] id "%s" does not match dir "%s"' % (pkg_id, app))
+              if len(vers) > 1:
+                  print('  [Error] - conflicting versions: %s' % sorted(vers))
                   rc = 1
               for n in names:
                   if '/local/' in n or n.endswith('/local'):
                       print('  [Error] - local path present: %s' % n)
                       rc = 1
-                  if n.split('/')[-1] in ('.DS_Store',) or '__MACOSX' in n:
+                  if n.split('/')[-1] == '.DS_Store' or '__MACOSX' in n:
                       print('  [Error] - junk path present: %s' % n)
                       rc = 1
               tf.close()
           sys.exit(rc)
           PYEOF
-      - name: Optional slim validation
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
-        continue-on-error: true
-        run: |
-          if command -v slim >/dev/null 2>&1
-          then
-            for pkg in /tmp/privatePackages/*.tgz
-            do
-              echo "[slim] ${pkg}"
-              slim validate "${pkg}" || echo "[slim] - reported issues for ${pkg}"
-            done
-          else
-            echo "[skip] - slim not installed on this runner (pip install splunk-packaging-toolkit)"
-          fi
       - name: Run Apps through App Inspect
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         env:
@@ -420,7 +485,7 @@ jobs:
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
           overall_rc=0
-          for candidateApp in $(ls *.tgz 2>/dev/null)
+          for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
           do
             echo "::group::[AppInspect] ${candidateApp}"
             AppRequest=$(curl -sX POST 'https://appinspect.splunk.com/v1/app/validate' \
@@ -520,7 +585,7 @@ jobs:
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
           deploy_rc=0
-          for candidateApp in $(ls *.tgz 2>/dev/null)
+          for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
           do
             echo "[ACS] - Installing ${candidateApp} to ${stack} via ${acs}"
             http_code=$(curl -s -o /tmp/acs_install_response.json -w '%{http_code}' \
@@ -528,6 +593,7 @@ jobs:
               --header "X-Splunk-Authorization: ${appinspect_token}" \
               --header "Authorization: Bearer ${stack_jwt}" \
               --header 'ACS-Legal-Ack: Y' \
+              --header 'Content-Type: application/octet-stream' \
               --data-binary "@${candidateApp}")
             echo "[ACS] - HTTP ${http_code}"
             cat /tmp/acs_install_response.json
