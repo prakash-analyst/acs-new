@@ -111,7 +111,7 @@ jobs:
       - name: Verify required tooling
         run: |
           missing=""
-          for tool in curl jq tar git base64 sed awk grep find python3 xxd
+          for tool in curl jq tar git base64 sed awk grep find xxd
           do
             if ! command -v ${tool} >/dev/null 2>&1
             then
@@ -125,29 +125,6 @@ jobs:
           fi
           tar --version | head -1
           jq --version
-          python3 --version
-      - name: Ensure slim is available
-        run: |
-          if command -v slim >/dev/null 2>&1
-          then
-            echo "[slim] - already installed"
-            slim --version || true
-            exit 0
-          fi
-          echo "[slim] - not found, attempting user install"
-          python3 -m pip install --user splunk-packaging-toolkit || true
-          export PATH="${HOME}/.local/bin:${PATH}"
-          echo "${HOME}/.local/bin" >> $GITHUB_PATH
-          if command -v slim >/dev/null 2>&1
-          then
-            echo "[slim] - installed"
-            slim --version || true
-          else
-            echo "[Error] - slim is required for packaging and is not installed"
-            echo "          Install it once on this runner with:"
-            echo "          pip3 install splunk-packaging-toolkit"
-            exit 1
-          fi
       - name: Reset working directories
         run: |
           rm -rf /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures /tmp/jq /tmp/current_private_apps.json
@@ -248,7 +225,7 @@ jobs:
               echo "[Error] - no numeric version found in ${appconf}"
               exit 1
             fi
-            new_version="${base}_${commit_short}"
+            new_version="${base}+${commit_short}"
             sed -i -e "s/^version[[:space:]]*=.*/version = ${new_version}/" "${appconf}"
             echo "[Version] - ${appconf} -> ${new_version}"
           done
@@ -267,6 +244,7 @@ jobs:
           find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
           find /tmp/privateApps -name '*.pyc' -print -delete
           find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
+          find /tmp/privateApps -name 'app.manifest' -print -delete
       - name: Show app.conf contents
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
@@ -276,35 +254,27 @@ jobs:
             cat "${appconf}"
             echo "===== end ====="
           done
-      - name: Validate and package apps with slim
+      - name: Package Apps for validation
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           cd /tmp/privateApps
-          pkg_rc=0
           for app in $(find . -maxdepth 1 -type d | sed 's/^\.\///g' | tail -n +2)
           do
-            echo "::group::[slim] ${app}"
-            if ! slim validate "${app}"
+            if [[ ! -f "${app}/default/app.conf" ]]
             then
-              echo "[Error] - slim validate failed for ${app}"
-              pkg_rc=1
-              echo "::endgroup::"
-              continue
+              echo "[Error] - ${app} has no default/app.conf"
+              exit 1
             fi
-            if ! slim package -o /tmp/privatePackages "${app}"
+            app_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\(.*\)/\1/p' "${app}/default/app.conf" | head -1 | tr '.+' '__')
+            if [[ -z "${app_version}" ]]
             then
-              echo "[Error] - slim package failed for ${app}"
-              pkg_rc=1
+              echo "[Error] - could not read version from ${app}/default/app.conf"
+              exit 1
             fi
-            echo "::endgroup::"
+            echo "[Package] - ${app} -> ${app}_${app_version}.tgz"
+            COPYFILE_DISABLE=1 tar -czf "/tmp/privatePackages/${app}_${app_version}.tgz" "${app}"
           done
-          echo "--- packages produced ---"
-          ls -l /tmp/privatePackages || true
-          if [[ ${pkg_rc} -ne 0 ]]
-          then
-            echo "[Error] - one or more apps failed slim validation or packaging"
-            exit 1
-          fi
+          ls -l /tmp/privatePackages
       - name: Show package locations
         if: always()
         run: |
@@ -315,7 +285,7 @@ jobs:
           echo "resolved /tmp : $(cd /tmp && pwd -P)"
           echo "--- /tmp/privatePackages ---"
           ls -la /tmp/privatePackages/ 2>/dev/null || echo "no privatePackages dir"
-          for pkg in /tmp/privatePackages/*.tar.gz /tmp/privatePackages/*.tgz
+          for pkg in /tmp/privatePackages/*.tgz
           do
             if [[ -f "${pkg}" ]]
             then
@@ -329,9 +299,7 @@ jobs:
         if: ${{ always() && steps.changed-files.outputs.any_changed == 'true' }}
         with:
           name: privatePackages
-          path: |
-            /tmp/privatePackages/*.tar.gz
-            /tmp/privatePackages/*.tgz
+          path: /tmp/privatePackages/*.tgz
           if-no-files-found: ignore
           retention-days: 5
       - name: Run Apps through App Inspect
@@ -347,7 +315,7 @@ jobs:
           echo "[cwd] - $(pwd)"
           ls -la
           overall_rc=0
-          for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
+          for candidateApp in $(ls *.tgz 2>/dev/null)
           do
             echo "::group::[AppInspect] ${candidateApp}"
             echo "[Package] - relative : ${candidateApp}"
@@ -453,7 +421,7 @@ jobs:
           echo "[dir listing]"
           ls -la
           deploy_rc=0
-          for candidateApp in $(ls *.tar.gz *.tgz 2>/dev/null)
+          for candidateApp in $(ls *.tgz 2>/dev/null)
           do
             echo "[Package] - relative : ${candidateApp}"
             echo "[Package] - absolute : $(readlink -f "${candidateApp}")"
