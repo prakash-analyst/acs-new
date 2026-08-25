@@ -238,9 +238,11 @@ jobs:
         env:
           modified_files: ${{ steps.changed-files.outputs.all_modified_files }}
         run: |
-          appsToVet=$(for modifiedFile in ${modified_files}; do echo ${modifiedFile} | grep "privateApps" | awk -F\/ '{print $2}'; done | uniq)
+          appsToVet=$(for modifiedFile in ${modified_files}; do echo ${modifiedFile} | grep "privateApps" | awk -F\/ '{print $2}'; done | sort -u)
+          echo "[Scope] - apps with changes in this commit:"
           for app in ${appsToVet}
           do
+            echo "  ${app}"
             cp -rp privateApps/${app} /tmp/privateApps
           done
           echo "---"
@@ -266,12 +268,13 @@ jobs:
               echo "" >> "${conf}"
             fi
           done
-      - name: Set deterministic app version
+      - name: Append commit hash to app version
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
-          run_number: ${{ github.run_number }}
           commit_sha: ${{ github.sha }}
         run: |
+          commit_short="${commit_sha:0:7}"
+          echo "[Commit] - ${commit_short}"
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
             base=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "${appconf}" | head -1)
@@ -280,17 +283,10 @@ jobs:
               echo "[Error] - no numeric version found in ${appconf}"
               exit 1
             fi
-            major=$(echo "${base}" | cut -d. -f1)
-            minor=$(echo "${base}" | cut -d. -f2)
-            if [[ -z "${minor}" ]]
-            then
-              minor=0
-            fi
-            new_version="${major}.${minor}.${run_number}"
+            new_version="${base}_${commit_short}"
             sed -i -e "s/^version[[:space:]]*=.*/version = ${new_version}/" "${appconf}"
             echo "[Version] - ${appconf} -> ${new_version}"
           done
-          echo "run ${run_number} corresponds to commit ${commit_sha}" >> $GITHUB_STEP_SUMMARY
       - name: Check for local directories
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
@@ -365,13 +361,13 @@ jobs:
           done
       - name: 'Upload built packages for inspection'
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.changed-files.outputs.any_changed == 'true' }}
         with:
           name: privatePackages
           path: |
             /tmp/privatePackages/*.tar.gz
             /tmp/privatePackages/*.tgz
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 5
       - name: Run Apps through App Inspect
         if: ${{ steps.changed-files.outputs.any_changed == 'true' }}

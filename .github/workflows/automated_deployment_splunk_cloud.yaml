@@ -192,24 +192,6 @@ jobs:
           path: /tmp/current_private_apps.json
           if-no-files-found: warn
           retention-days: 5
-      - name: Fresh Install App Deploy
-        id: fresh-install-app-deploy
-        env:
-          stack: ${{ secrets.STACK_NAME }}
-        run: |
-          deployExisting=false
-          installed=$(jq -r '.apps[].name' /tmp/current_private_apps.json)
-          for app in $(ls privateApps | grep -v "README.md")
-          do
-            if [[ ! "${installed}" =~ "${app}" ]]
-            then
-              echo "${app} not present on target"
-              cp -rp privateApps/${app} /tmp/privateApps
-              deployExisting=true
-            fi
-          done
-          echo "deployExisting=${deployExisting}" >> $GITHUB_OUTPUT
-          echo "${deployExisting}"
       - name: Get changed files
         id: changed-files
         uses: tj-actions/changed-files@v47
@@ -221,15 +203,17 @@ jobs:
         env:
           modified_files: ${{ steps.changed-files.outputs.all_modified_files }}
         run: |
-          appsToVet=$(for modifiedFile in ${modified_files}; do echo ${modifiedFile} | grep "privateApps" | awk -F\/ '{print $2}'; done | uniq)
+          appsToVet=$(for modifiedFile in ${modified_files}; do echo ${modifiedFile} | grep "privateApps" | awk -F\/ '{print $2}'; done | sort -u)
+          echo "[Scope] - apps with changes in this commit:"
           for app in ${appsToVet}
           do
+            echo "  ${app}"
             cp -rp privateApps/${app} /tmp/privateApps
           done
           echo "---"
           ls -l /tmp/privateApps
       - name: Normalise conf file encoding
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           for conf in $(find /tmp/privateApps -type f -name '*.conf')
           do
@@ -249,12 +233,13 @@ jobs:
               echo "" >> "${conf}"
             fi
           done
-      - name: Set deterministic app version
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+      - name: Append commit hash to app version
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
-          run_number: ${{ github.run_number }}
           commit_sha: ${{ github.sha }}
         run: |
+          commit_short="${commit_sha:0:7}"
+          echo "[Commit] - ${commit_short}"
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
             base=$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "${appconf}" | head -1)
@@ -263,19 +248,12 @@ jobs:
               echo "[Error] - no numeric version found in ${appconf}"
               exit 1
             fi
-            major=$(echo "${base}" | cut -d. -f1)
-            minor=$(echo "${base}" | cut -d. -f2)
-            if [[ -z "${minor}" ]]
-            then
-              minor=0
-            fi
-            new_version="${major}.${minor}.${run_number}"
+            new_version="${base}_${commit_short}"
             sed -i -e "s/^version[[:space:]]*=.*/version = ${new_version}/" "${appconf}"
             echo "[Version] - ${appconf} -> ${new_version}"
           done
-          echo "run ${run_number} corresponds to commit ${commit_sha}" >> $GITHUB_STEP_SUMMARY
       - name: Check for local directories
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           if [[ $(find /tmp/privateApps -type d -name local | wc -l) -gt 0 ]]
           then
@@ -283,14 +261,14 @@ jobs:
             exit 1
           fi
       - name: Strip junk files before packaging
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           find /tmp/privateApps -name '.DS_Store' -print -delete
           find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
           find /tmp/privateApps -name '*.pyc' -print -delete
           find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
       - name: Show app.conf contents
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           for appconf in $(find /tmp/privateApps -type f -name app.conf)
           do
@@ -299,7 +277,7 @@ jobs:
             echo "===== end ====="
           done
       - name: Validate and package apps with slim
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         run: |
           cd /tmp/privateApps
           pkg_rc=0
@@ -348,16 +326,16 @@ jobs:
           done
       - name: 'Upload built packages for inspection'
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.changed-files.outputs.any_changed == 'true' }}
         with:
           name: privatePackages
           path: |
             /tmp/privatePackages/*.tar.gz
             /tmp/privatePackages/*.tgz
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 5
       - name: Run Apps through App Inspect
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
           stack: ${{ secrets.STACK_NAME }}
           stack_jwt: ${{ secrets.STACK_TOKEN }}
@@ -462,7 +440,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 5
       - name: Install or Upgrade Apps
-        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        if: ${{ steps.changed-files.outputs.any_changed == 'true' }}
         env:
           stack: ${{ secrets.STACK_NAME }}
           stack_jwt: ${{ secrets.STACK_TOKEN }}
