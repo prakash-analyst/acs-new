@@ -5,13 +5,17 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: splunk-cloud-deploy
+  cancel-in-progress: false
+
 env:
-  acs_endpoint: staging.admin.splunk.com
+  acs_endpoint: admin.splunk.com
 
 jobs:
 
   validate_stack_and_acs_credentials_configured:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Check STACK_NAME is set as a GitHub Secret
         env:
@@ -33,7 +37,7 @@ jobs:
           fi
 
   validate_splunkbase_credentials_configured:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Check SPLUNKBASE_USERNAME is set as a GitHub Secret
         env:
@@ -59,7 +63,7 @@ jobs:
       splunkapi_auth_token: ${{ steps.auth-splunk-api.outputs.api_auth_token }}
       splunkbase_auth_token: ${{ steps.authenticate-splunkbase.outputs.auth_token }}
     needs: [validate_splunkbase_credentials_configured, validate_stack_and_acs_credentials_configured]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: authenticate with splunkbase
         id: authenticate-splunkbase
@@ -97,22 +101,51 @@ jobs:
 
   private_app_management:
     needs: [authenticate_with_splunk]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Check out repo code
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Install jq for JSON parsing
-        run: sudo apt-get install -y jq
+          clean: true
+      - name: Verify required tooling
+        run: |
+          for tool in curl jq tar git base64 sed awk
+          do
+            if ! command -v ${tool} >/dev/null 2>&1
+            then
+              echo "[Error] - ${tool} not found on this self-hosted runner"
+              exit 1
+            fi
+          done
+          tar --version
+          jq --version
+      - name: Reset working directories
+        run: |
+          rm -rf /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures /tmp/current_private_apps.json
+          mkdir -p /tmp/privateApps /tmp/privatePackages /tmp/appinspect_failures
       - name: Gather installed private apps from stack
         env:
           stack: ${{ secrets.STACK_NAME }}
           stack_jwt: ${{ secrets.STACK_TOKEN }}
           acs: ${{ env.acs_endpoint }}
         run: |
-          curl -s "https://${acs}/${stack}/adminconfig/v2/apps/victoria?count=100" \
-          --header "Authorization: Bearer ${stack_jwt}" > /tmp/current_private_apps.json
+          http_code=$(curl -s -o /tmp/current_private_apps.json -w '%{http_code}' \
+            "https://${acs}/${stack}/adminconfig/v2/apps/victoria?count=100" \
+            --header "Authorization: Bearer ${stack_jwt}")
+          echo "[ACS] - GET apps/victoria returned ${http_code} from ${acs}"
+          if [[ "${http_code}" != "200" ]]
+          then
+            echo "[Error] - ACS did not return 200. Response body:"
+            cat /tmp/current_private_apps.json
+            exit 1
+          fi
+          if ! jq -e '.apps' /tmp/current_private_apps.json >/dev/null 2>&1
+          then
+            echo "[Error] - ACS response has no .apps array"
+            cat /tmp/current_private_apps.json
+            exit 1
+          fi
       - name: 'Upload Current Private Apps'
         uses: actions/upload-artifact@v4
         if: success()
@@ -126,11 +159,11 @@ jobs:
         env:
           stack: ${{ secrets.STACK_NAME }}
         run: |
-          mkdir -p /tmp/privateApps
           deployExisting=false
+          installed=$(jq -r '.apps[].name' /tmp/current_private_apps.json)
           for app in $(ls privateApps | grep -v "README.md")
           do
-            if [[ ! "$(jq -r '.apps[].name' /tmp/current_private_apps.json)" =~ "${app}" ]]
+            if [[ ! "${installed}" =~ "${app}" ]]
             then
               echo "${app} not present on target"
               cp -rp privateApps/${app} /tmp/privateApps
@@ -150,7 +183,6 @@ jobs:
         env:
           modified_files: ${{ steps.changed-files.outputs.all_modified_files }}
         run: |
-          mkdir -p /tmp/privateApps
           appsToVet=$(for modifiedFile in ${modified_files}; do echo ${modifiedFile} | grep "privateApps" | awk -F\/ '{print $2}'; done | uniq)
           for app in ${appsToVet}
           do
@@ -181,37 +213,54 @@ jobs:
             echo "Local Directories Present"
             exit 1
           fi
+      - name: Strip junk files before packaging
+        if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
+        run: |
+          find /tmp/privateApps -name '.DS_Store' -print -delete
+          find /tmp/privateApps -name '__MACOSX' -type d -print -exec rm -rf {} +
+          find /tmp/privateApps -name '*.pyc' -print -delete
+          find /tmp/privateApps -name '__pycache__' -type d -print -exec rm -rf {} +
       - name: Package Apps for validation
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         run: |
-          mkdir -p /tmp/privatePackages
           cd /tmp/privateApps
-          tar --version
           for app in $(find . -maxdepth 1 -type d | sed 's/[\.\/]+//g' | sed 's/^\.\///g' | tail -n +2)
           do
             COPYFILE_DISABLE=1 tar --format ustar -zcvf /tmp/privatePackages/${app}_$(cat ${app}/default/app.conf | grep version | sed 's/[a-z\=\. ]//g').tgz ${app}
           done
+          ls -l /tmp/privatePackages
       - name: Run Apps through App Inspect
         if: ${{ (steps.changed-files.outputs.any_changed == 'true') || (steps.fresh-install-app-deploy.outputs.deployExisting == 'true') }}
         env:
           stack: ${{ secrets.STACK_NAME }}
           stack_jwt: ${{ secrets.STACK_TOKEN }}
           appinspect_token: ${{ needs.authenticate_with_splunk.outputs.splunkapi_auth_token }}
+          allow_manual_check: 'true'
         run: |
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
-          mkdir -p /tmp/appinspect_failures
           cd /tmp/privatePackages
-          find . -type f
+          overall_rc=0
           for candidateApp in $(ls)
           do
-            echo "[AppInspect] - ${candidateApp}"
-            AppRequest=$(curl -sX POST 'https://appinspect.splunk.com/v1/app/validate' --header "Authorization: Bearer ${appinspect_token}" --header "Cache-Control: no-cache" --form "app_package=@\"${candidateApp}\"" --form 'included_tags="private_app"')
+            echo "::group::[AppInspect] ${candidateApp}"
+            AppRequest=$(curl -sX POST 'https://appinspect.splunk.com/v1/app/validate' \
+              --header "Authorization: Bearer ${appinspect_token}" \
+              --header "Cache-Control: no-cache" \
+              --form "app_package=@\"${candidateApp}\"" \
+              --form 'included_tags="private_app"')
             echo "${AppRequest}"
-            requestURL=$(echo ${AppRequest} | jq ".links[]| select(.rel==\"status\")|.href" | sed 's/\"//g')
-            reportURL=$(echo ${AppRequest} | jq ".links[]| select(.rel==\"report\")|.href" | sed 's/\"//g')
+            requestURL=$(echo ${AppRequest} | jq -r '.links[]? | select(.rel=="status") | .href')
+            reportURL=$(echo ${AppRequest} | jq -r '.links[]? | select(.rel=="report") | .href')
+            if [[ -z "${requestURL}" || "${requestURL}" == "null" ]]
+            then
+              echo "[Error] - Submission rejected for ${candidateApp}"
+              overall_rc=1
+              echo "::endgroup::"
+              continue
+            fi
             appInspectStatus=$(curl -sX GET "https://appinspect.splunk.com${requestURL}" --header "Authorization: Bearer ${appinspect_token}")
             LOOPCOUNTER=0
-            while [[ $(echo ${appInspectStatus} | jq ".status" | sed 's/\"//g') == "PROCESSING" && ${LOOPCOUNTER} -lt 60 ]]
+            while [[ $(echo ${appInspectStatus} | jq -r '.status') == "PROCESSING" && ${LOOPCOUNTER} -lt 60 ]]
             do
               sleep 15
               appInspectStatus=$(curl -sX GET "https://appinspect.splunk.com${requestURL}" --header "Authorization: Bearer ${appinspect_token}")
@@ -219,24 +268,49 @@ jobs:
             done
             if [[ ${LOOPCOUNTER} -eq 60 ]]
             then
-              echo "[ERROR] - Timeout occurred validating ${candidateApp}"
-              exit 1
+              echo "[Error] - Timeout occurred validating ${candidateApp}"
+              overall_rc=1
+              echo "::endgroup::"
+              continue
             fi
-            if [[ $(echo ${appInspectStatus} | jq ".status" | sed 's/\"//g') == "SUCCESS" ]]
+            if [[ $(echo ${appInspectStatus} | jq -r '.status') != "SUCCESS" ]]
             then
-              if [[ $(echo ${appInspectStatus} | jq ".info.error") -eq 0 && $(echo ${appInspectStatus} | jq ".info.failure") -eq 0 && $(echo ${appInspectStatus} | jq ".info.manual_check") -eq 0 ]]
-              then
-                echo ${appInspectStatus}
-              else
-                echo "[Error] - App Failed Appinspect, see report for more information (${candidateApp})"
-                curl -sX GET "https://appinspect.splunk.com${reportURL}" --header "Authorization: Bearer ${appinspect_token}" > /tmp/appinspect_failures/${candidateApp}.json
-                exit 1
-              fi
-            else
               echo "[Error] - Appinspect went to unknown state while validating ${candidateApp}"
-              exit 1
+              echo "${appInspectStatus}"
+              overall_rc=1
+              echo "::endgroup::"
+              continue
             fi
+            errors=$(echo ${appInspectStatus} | jq -r '.info.error')
+            failures=$(echo ${appInspectStatus} | jq -r '.info.failure')
+            manuals=$(echo ${appInspectStatus} | jq -r '.info.manual_check')
+            echo "[Summary] ${candidateApp} :: error=${errors} failure=${failures} manual_check=${manuals}"
+            reportFile="/tmp/appinspect_failures/${candidateApp}.json"
+            curl -sX GET "https://appinspect.splunk.com${reportURL}" \
+              --header "Authorization: Bearer ${appinspect_token}" \
+              --header "Accept: application/json" > "${reportFile}"
+            if [[ ${errors} -gt 0 || ${failures} -gt 0 ]]
+            then
+              echo "[Error] - ${candidateApp} has blocking findings:"
+              jq -r '.reports[].groups[].checks[] | select(.result=="failure" or .result=="error") | "  [\(.result|ascii_upcase)] \(.name)", (.messages[]? | "        \(.filename // "n/a"):\(.line // "n/a") — \(.message|gsub("\s+";" "))")' "${reportFile}"
+              overall_rc=1
+            fi
+            if [[ ${manuals} -gt 0 ]]
+            then
+              echo "[Notice] - ${candidateApp} has ${manuals} manual check(s):"
+              jq -r '.reports[].groups[].checks[] | select(.result=="manual_check") | "  [MANUAL] \(.name)", (.messages[]? | "        \(.message|gsub("\s+";" "))")' "${reportFile}"
+              if [[ "${allow_manual_check}" != "true" ]]
+              then
+                overall_rc=1
+              fi
+            fi
+            if [[ ${errors} -eq 0 && ${failures} -eq 0 ]]
+            then
+              rm -f "${reportFile}"
+            fi
+            echo "::endgroup::"
           done
+          exit ${overall_rc}
       - name: 'Upload AppInspect Failures'
         uses: actions/upload-artifact@v4
         if: failure()
@@ -255,12 +329,24 @@ jobs:
         run: |
           appinspect_token=$(echo "${appinspect_token}" | base64 -d)
           cd /tmp/privatePackages
-          for candidateApp in $(ls)
+          deploy_rc=0
+          for candidateApp in $(ls *.tgz 2>/dev/null)
           do
+            echo "[ACS] - Installing ${candidateApp} to ${stack} via ${acs}"
             appInstallation=$(curl -sX POST "https://${acs}/${stack}/adminconfig/v2/apps/victoria" \
             --header "X-Splunk-Authorization: ${appinspect_token}" \
             --header "Authorization: Bearer ${stack_jwt}" \
             --header 'ACS-Legal-Ack: Y' \
             --data-binary "@${candidateApp}")
             echo ${appInstallation}
+            if echo "${appInstallation}" | jq -e '.code' >/dev/null 2>&1
+            then
+              echo "[Error] - ACS returned an error for ${candidateApp}"
+              deploy_rc=1
+            fi
           done
+          exit ${deploy_rc}
+      - name: Clean up working directories
+        if: always()
+        run: |
+          rm -rf /tmp/privateApps /tmp/privatePackages /tmp/current_private_apps.json
