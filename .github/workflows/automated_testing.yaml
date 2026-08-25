@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  acs_endpoint: admin.splunk.com
+  acs_endpoint: staging.admin.splunk.com
   json_schema: https://admin.splunk.com/service/info/specs/v2/openapi.json
 
 jobs:
@@ -104,10 +104,10 @@ jobs:
       - name: Check out repo code
         uses: actions/checkout@v5
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Get changed files
         id: changed-files
-        uses: tj-actions/changed-files@v46
+        uses: tj-actions/changed-files@v47
         with:
           files: |
             privateApps/**
@@ -164,7 +164,7 @@ jobs:
         run: sudo apt-get install -y jq
       - name: Get changed files
         id: changed-files
-        uses: tj-actions/changed-files@v46
+        uses: tj-actions/changed-files@v47
         with:
           files: |
             privateApps/**
